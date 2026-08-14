@@ -326,6 +326,14 @@ optional arguments:
   --ffmpeg-args FFMPEG_ARGS
                         Extra arguments to pass to the ffmpeg command used for
                         frame capture (default: None)
+  --random              Generate random timestamps instead of uniform ones
+                        (default: False)
+  --seed SEED           Seed for deterministic random timestamp generation
+                        (enables random mode) (default: None)
+  --random-min-spacing RANDOM_MIN_SPACING
+                        Minimum spacing between random timestamps. Can be a
+                        fraction of uniform spacing (e.g. 0.2 for 20%) or
+                        absolute seconds (e.g. 120). (default: None)
 
 
 ```

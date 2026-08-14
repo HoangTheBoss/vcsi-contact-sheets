@@ -119,6 +119,7 @@ DEFAULT_TIMESTAMP_POSITION = TimestampPosition.se
 DEFAULT_FRAME_TYPE = None
 DEFAULT_INTERVAL = None
 DEFAULT_FFMPEG_ARGS = None
+DEFAULT_RANDOM_MIN_SPACING = None
 
 
 class Config:
@@ -157,6 +158,7 @@ class Config:
     frame_type = DEFAULT_FRAME_TYPE
     interval = DEFAULT_INTERVAL
     ffmpeg_args = DEFAULT_FFMPEG_ARGS
+    random_min_spacing = DEFAULT_RANDOM_MIN_SPACING
 
     @classmethod
     def load_configuration(cls, filename=DEFAULT_CONFIG_FILE):
@@ -669,22 +671,137 @@ def total_delay_seconds(media_info, args):
     return delay
 
 
+def get_active_time_range(media_info, args):
+    """Computes (min_time, max_time, duration) for sampling frames."""
+    start_delay_seconds = math.floor(media_info.duration_seconds * args.start_delay_percent / 100)
+    end_delay_seconds = math.floor(media_info.duration_seconds * args.end_delay_percent / 100)
+    min_time = start_delay_seconds
+    max_time = max(min_time + 1.0, media_info.duration_seconds - end_delay_seconds)
+    duration = max_time - min_time
+    return min_time, max_time, duration
+
+
+def get_rng(args):
+    """Initializes and returns a Random instance if random sampling is enabled, else None."""
+    is_random = getattr(args, 'random', False) or getattr(args, 'seed', None) is not None
+    if not is_random:
+        return None
+
+    import random
+    seed = getattr(args, 'seed', None)
+    if seed is None:
+        seed = random.randrange(1000000)
+        args.seed = seed
+        print("Using generated random seed: %s" % seed)
+    return random.Random(seed)
+
+
+def compute_min_spacing(duration, total_slots, min_spacing_arg):
+    """Calculates timestamp spacing clearance delta."""
+    uniform_spacing = duration / (total_slots + 1) if total_slots > 0 else 0
+    if min_spacing_arg is None:
+        return 0.20 * uniform_spacing
+    elif isinstance(min_spacing_arg, float) and min_spacing_arg <= 1.0:
+        return min_spacing_arg * uniform_spacing
+    else:
+        return float(min_spacing_arg)
+
+
 def timestamp_generator(media_info, args):
-    """Generates `num_samples` uniformly distributed timestamps over time.
+    """Generates `num_samples` uniformly distributed or random timestamps over time.
     Timestamps will be selected in the range specified by start_delay_percent and end_delay percent.
     For example, `end_delay_percent` can be used to avoid making captures during the ending credits.
     """
-    delay = total_delay_seconds(media_info, args)
-    capture_interval = (media_info.duration_seconds - delay) / (args.num_samples + 1)
+    min_time, max_time, duration = get_active_time_range(media_info, args)
+    rng = get_rng(args)
 
-    if args.interval is not None:
-        capture_interval = int(args.interval.total_seconds())
-    start_delay_seconds = math.floor(media_info.duration_seconds * args.start_delay_percent / 100)
-    time = start_delay_seconds + capture_interval
+    if rng is not None:
+        min_spacing = compute_min_spacing(duration, args.num_samples, getattr(args, 'random_min_spacing', None))
 
-    for i in range(args.num_samples):
-        yield (time, MediaInfo.pretty_duration(time, show_millis=True))
-        time += capture_interval
+        if args.num_samples > 1 and (args.num_samples - 1) * min_spacing >= duration:
+            min_spacing = duration / (args.num_samples + 1)
+
+        if args.num_samples > 1:
+            max_y = duration - (args.num_samples - 1) * min_spacing
+            y_vals = [rng.uniform(0, max_y) for _ in range(args.num_samples)]
+            y_vals.sort()
+            times = [min_time + y_vals[i] + i * min_spacing for i in range(args.num_samples)]
+        else:
+            times = [rng.uniform(min_time, max_time) for _ in range(args.num_samples)]
+
+        times.sort()
+        for t in times:
+            yield (t, MediaInfo.pretty_duration(t, show_millis=True))
+    else:
+        capture_interval = duration / (args.num_samples + 1)
+        if args.interval is not None:
+            capture_interval = int(args.interval.total_seconds())
+        time = min_time + capture_interval
+
+        for i in range(args.num_samples):
+            yield (time, MediaInfo.pretty_duration(time, show_millis=True))
+            time += capture_interval
+
+
+def generate_hybrid_timestamps(media_info, args, manual_ts, grid_total):
+    """Generates auto timestamps across the full video duration to fill grid_total,
+    while dodging existing manual timestamps.
+    """
+    manual_sec = sorted([t[0] for t in manual_ts])
+    num_auto = grid_total - len(manual_ts)
+    if num_auto <= 0:
+        return manual_ts
+
+    min_time, max_time, duration = get_active_time_range(media_info, args)
+    ideal_step = duration / (grid_total + 1)
+    delta = compute_min_spacing(duration, grid_total, getattr(args, 'random_min_spacing', None))
+    rng = get_rng(args)
+
+    if rng is not None:
+        auto_times = []
+        attempts = 0
+        while len(auto_times) < num_auto and attempts < num_auto * 200:
+            attempts += 1
+            t = rng.uniform(min_time, max_time)
+            if any(abs(t - m) < delta for m in manual_sec) or any(abs(t - a) < delta for a in auto_times):
+                continue
+            auto_times.append(t)
+
+        if len(auto_times) < num_auto:
+            grid_points = [min_time + (i + 1) * ideal_step for i in range(grid_total)]
+            for gp in grid_points:
+                if len(auto_times) >= num_auto:
+                    break
+                if not any(abs(gp - m) < delta for m in manual_sec) and not any(abs(gp - a) < delta for a in auto_times):
+                    auto_times.append(gp)
+    else:
+        grid_points = [min_time + (i + 1) * ideal_step for i in range(grid_total)]
+        auto_times = []
+        for gp in grid_points:
+            too_close = False
+            for m in manual_sec:
+                if abs(gp - m) < delta:
+                    too_close = True
+                    nudge_right = m + delta
+                    nudge_left = m - delta
+                    candidate = None
+                    if nudge_right <= max_time and not any(abs(nudge_right - m2) < delta for m2 in manual_sec):
+                        candidate = nudge_right
+                    elif nudge_left >= min_time and not any(abs(nudge_left - m2) < delta for m2 in manual_sec):
+                        candidate = nudge_left
+                    if candidate is not None and not any(abs(candidate - a) < delta for a in auto_times):
+                        auto_times.append(candidate)
+                    break
+            if not too_close and not any(abs(gp - a) < delta for a in auto_times):
+                auto_times.append(gp)
+
+        auto_times = auto_times[:num_auto]
+        while len(auto_times) < num_auto:
+            t_fill = min_time + (len(auto_times) + 1) * (duration / (num_auto + 1))
+            auto_times.append(t_fill)
+
+    auto_ts = [(t, MediaInfo.pretty_duration(t, show_millis=True)) for t in auto_times]
+    return sorted(manual_ts + auto_ts, key=lambda x: x[0])
 
 
 def select_sharpest_images(
@@ -704,7 +821,17 @@ def select_sharpest_images(
     if args.manual_timestamps is None:
         timestamps = timestamp_generator(media_info, args)
     else:
-        timestamps = [(MediaInfo.pretty_to_seconds(x), x) for x in args.manual_timestamps]
+        manual_ts = [(MediaInfo.pretty_to_seconds(x), x) for x in args.manual_timestamps]
+
+        has_grid_arg = any(x in sys.argv for x in ['-g', '--grid'])
+        grid_total = 0
+        if args.grid and args.grid.x > 0 and args.grid.y > 0:
+            grid_total = args.grid.x * args.grid.y
+
+        if (has_grid_arg or args.grid != DEFAULT_GRID_SIZE) and grid_total > len(manual_ts):
+            timestamps = generate_hybrid_timestamps(media_info, args, manual_ts, grid_total)
+        else:
+            timestamps = manual_ts
 
     def do_capture(ts_tuple, width, height, suffix, args):
         fd, filename = tempfile.mkstemp(suffix=suffix)
@@ -1623,8 +1750,31 @@ def main():
         default=Config.ffmpeg_args,
         dest="ffmpeg_args"
     )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="Generate random timestamps instead of uniform ones",
+        dest="random"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed for deterministic random timestamp generation (enables random mode)",
+        dest="seed"
+    )
+    parser.add_argument(
+        "--random-min-spacing",
+        type=float,
+        default=Config.random_min_spacing,
+        help="Minimum spacing between random timestamps. Can be a fraction of uniform spacing (e.g. 0.2 for 20%%) or absolute seconds (e.g. 120).",
+        dest="random_min_spacing"
+    )
 
     args = parser.parse_args()
+
+    if args.seed is not None:
+        args.random = True
 
     if args.list_template_attributes:
         print_template_attributes()
@@ -1752,9 +1902,19 @@ def process_file(path, args):
     if args.manual_timestamps is not None:
         mframes_size = len(args.manual_timestamps)
 
-        args.num_selected = mframes_size
-        args.num_samples = mframes_size
-        args.num_groups = mframes_size
+        has_grid_arg = any(x in sys.argv for x in ['-g', '--grid'])
+        grid_total = 0
+        if args.grid and args.grid.x > 0 and args.grid.y > 0:
+            grid_total = args.grid.x * args.grid.y
+
+        if (has_grid_arg or args.grid != DEFAULT_GRID_SIZE) and grid_total > mframes_size:
+            args.num_selected = grid_total
+            args.num_samples = grid_total
+            args.num_groups = grid_total
+        else:
+            args.num_selected = mframes_size
+            args.num_samples = mframes_size
+            args.num_groups = mframes_size
 
     if args.interval is not None or args.manual_timestamps is not None:
         square_side = math.ceil(math.sqrt(args.num_samples))
